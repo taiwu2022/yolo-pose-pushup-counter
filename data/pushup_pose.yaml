@@ -1,0 +1,32 @@
+# 训练时把 path/train/val 改成你自己的数据集路径
+# 参考 Ultralytics COCO8-pose YAML（kpt_shape: [17,3]）
+path: datasets/pushup_pose
+train: images/train
+val: images/val
+test: images/test
+
+kpt_shape: [17, 3]
+flip_idx: [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
+
+names:
+  0: person
+
+kpt_names:
+  0:
+    - nose
+    - left_eye
+    - right_eye
+    - left_ear
+    - right_ear
+    - left_shoulder
+    - right_shoulder
+    - left_elbow
+    - right_elbow
+    - left_wrist
+    - right_wrist
+    - left_hip
+    - right_hip
+    - left_knee
+    - right_knee
+    - left_ankle
+    - right_ankle
