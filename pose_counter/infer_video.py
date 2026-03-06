@@ -8,9 +8,15 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 from .pose_utils import extract_pose
-from .visualize import draw_skeleton, draw_hud
+from .visualize import (
+    draw_skeleton,
+    draw_hud,
+    compose_with_simulated_views,
+    draw_ground_mask_from_binary,
+)
 from .utils.video_io import probe_video, make_writer
 from .counters.pushup import PushUpCounter, PushUpConfig
+from .ground_seg import GroundSegEstimator, GroundSegConfig
 
 
 def parse_args():
@@ -32,6 +38,11 @@ def parse_args():
     p.add_argument("--show", action="store_true", help="Show realtime window (can be slow).")
     p.add_argument("--no-skeleton", action="store_true", help="Do not draw skeleton.")
     p.add_argument("--no-hud", action="store_true", help="Do not draw HUD.")
+    p.add_argument("--no-sim-views", action="store_true", help="Do not append simulated viewpoint panels on the right.")
+    p.add_argument("--no-ground-mask", action="store_true", help="Do not draw estimated ground mask.")
+    p.add_argument("--ground-alpha", type=float, default=0.28, help="Ground mask alpha blending.")
+    p.add_argument("--ground-seg-model", type=str, default="nvidia/segformer-b0-finetuned-ade-512-512", help="HF model for semantic ground segmentation.")
+    p.add_argument("--ground-seg-stride", type=int, default=2, help="Run segmentation every N frames and reuse last mask.")
     p.add_argument("--person", type=str, default="largest", choices=["largest"], help="Person selection strategy (single-person default).")
     return p.parse_args()
 
@@ -57,8 +68,18 @@ def main():
     counter = PushUpCounter(fps=meta.fps, cfg=cfg)
 
     model = YOLO(args.weights)
+    ground_seg = None
+    if not args.no_ground_mask:
+        ground_seg = GroundSegEstimator(
+            cfg=GroundSegConfig(
+                model_name=str(args.ground_seg_model),
+                stride=max(1, int(args.ground_seg_stride)),
+            )
+        )
 
-    writer = make_writer(out_path, meta.fps, meta.width, meta.height)
+    panel_w = max(360, int(meta.width * 0.42)) if not args.no_sim_views else 0
+    out_w = meta.width + panel_w
+    writer = make_writer(out_path, meta.fps, out_w, meta.height)
 
     # Stream results frame-by-frame for efficiency
     stream = model.predict(
@@ -85,6 +106,10 @@ def main():
             if not args.no_skeleton:
                 draw_skeleton(frame, det.xy, det.conf, conf_th=float(args.kpt_conf))
 
+        if not args.no_ground_mask:
+            seg_mask = ground_seg.update(frame) if ground_seg is not None else None
+            draw_ground_mask_from_binary(frame, seg_mask, alpha=float(args.ground_alpha))
+
         if not args.no_hud:
             draw_hud(
                 frame,
@@ -95,10 +120,21 @@ def main():
                 frame_idx=frame_idx,
             )
 
-        writer.write(frame)
+        out_frame = frame
+        if not args.no_sim_views:
+            det_xy = det.xy if det is not None else None
+            det_conf = det.conf if det is not None else None
+            out_frame = compose_with_simulated_views(
+                frame=frame,
+                kpt_xy=det_xy,
+                kpt_conf=det_conf,
+                conf_th=float(args.kpt_conf),
+            )
+
+        writer.write(out_frame)
 
         if args.show:
-            cv2.imshow("pushup counter", frame)
+            cv2.imshow("pushup counter", out_frame)
             if cv2.waitKey(1) & 0xFF == 27:  # ESC
                 break
 
