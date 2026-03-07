@@ -1,0 +1,35 @@
+{
+  "videos": [
+    "data/raw_videos/1.MOV",
+    "data/raw_videos/2.MOV",
+    "data/raw_videos/3.MOV",
+    "data/raw_videos/4.MOV",
+    "data/raw_videos/5.MOV",
+    "data/raw_videos/6.MOV",
+    "data/raw_videos/IMG_5512.mov",
+    "data/raw_videos/test.MOV"
+  ],
+  "split_mode": "video",
+  "train_videos": [
+    "1.MOV",
+    "2.MOV",
+    "3.MOV",
+    "4.MOV",
+    "5.MOV",
+    "IMG_5512.mov"
+  ],
+  "val_videos": [
+    "6.MOV",
+    "test.MOV"
+  ],
+  "num_train": 624,
+  "num_val": 75,
+  "num_pos": 493,
+  "num_neg": 206,
+  "clip_len": 48,
+  "stride": 12,
+  "classes": [
+    "other",
+    "push_up"
+  ]
+}
