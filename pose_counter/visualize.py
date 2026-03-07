@@ -1,9 +1,75 @@
 from __future__ import annotations
 
+from functools import lru_cache
+from pathlib import Path
+
 import cv2
 import numpy as np
 
 from .constants import KPT, SKELETON_EDGES
+
+
+HEAD_KPTS = {
+    KPT["nose"],
+    KPT["left_eye"],
+    KPT["right_eye"],
+    KPT["left_ear"],
+    KPT["right_ear"],
+}
+
+
+@lru_cache(maxsize=2)
+def _load_head_asset(path: str) -> np.ndarray | None:
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None or img.ndim != 3:
+        return None
+    if img.shape[2] == 3:
+        alpha = np.full((img.shape[0], img.shape[1], 1), 255, dtype=np.uint8)
+        img = np.concatenate([img, alpha], axis=2)
+    if img.shape[2] != 4:
+        return None
+    return img
+
+
+def _paste_rgba_center(dst_bgr: np.ndarray, src_rgba: np.ndarray, center_xy: tuple[float, float], out_size: int, angle_deg: float) -> None:
+    out_size = int(max(8, out_size))
+    src = cv2.resize(src_rgba, (out_size, out_size), interpolation=cv2.INTER_AREA)
+
+    c = (out_size * 0.5, out_size * 0.5)
+    m = cv2.getRotationMatrix2D(c, float(angle_deg), 1.0)
+    rot = cv2.warpAffine(
+        src,
+        m,
+        (out_size, out_size),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+    x0 = int(round(center_xy[0] - out_size * 0.5))
+    y0 = int(round(center_xy[1] - out_size * 0.5))
+    x1 = x0 + out_size
+    y1 = y0 + out_size
+
+    h, w = dst_bgr.shape[:2]
+    cx0 = max(0, x0)
+    cy0 = max(0, y0)
+    cx1 = min(w, x1)
+    cy1 = min(h, y1)
+    if cx0 >= cx1 or cy0 >= cy1:
+        return
+
+    sx0 = cx0 - x0
+    sy0 = cy0 - y0
+    sx1 = sx0 + (cx1 - cx0)
+    sy1 = sy0 + (cy1 - cy0)
+
+    patch = rot[sy0:sy1, sx0:sx1]
+    rgb = patch[:, :, :3].astype(np.float32)
+    a = (patch[:, :, 3:4].astype(np.float32) / 255.0)
+    dst = dst_bgr[cy0:cy1, cx0:cx1].astype(np.float32)
+    out = rgb * a + dst * (1.0 - a)
+    dst_bgr[cy0:cy1, cx0:cx1] = np.clip(out, 0, 255).astype(np.uint8)
 
 
 def draw_skeleton(
@@ -32,12 +98,18 @@ def draw_hud(
     count: int,
     phase: str,
     angle: float | None = None,
+    head_ground_dist: float | None = None,
+    ready_to_count: bool | None = None,
     fps: float | None = None,
     frame_idx: int | None = None,
 ):
     lines = [f"Count: {count}", f"Phase: {phase}"]
+    if ready_to_count is not None:
+        lines.append("Ready to count push up" if ready_to_count else "Not Ready to count push up")
     if angle is not None:
         lines.append(f"Elbow angle: {angle:.1f} deg")
+    if head_ground_dist is not None:
+        lines.append(f"Head-ground dist: {head_ground_dist:.3f}")
     if fps is not None and frame_idx is not None:
         t = frame_idx / fps
         lines.append(f"Time: {t:.2f}s")
@@ -160,24 +232,6 @@ def _draw_view_tile(
     tile[:] = (22, 22, 22)
     cv2.rectangle(tile, (0, 0), (w - 1, h - 1), (70, 70, 70), 1, cv2.LINE_AA)
 
-    # Simulated ground as a tilted parallelogram for a stable "virtual world" cue.
-    base_y = int(h * 0.70)
-    near_y = int(h * 0.94)
-    skew = int(w * 0.16)
-    ground_poly = np.array(
-        [
-            [max(0, 8 + skew), base_y],
-            [min(w - 1, w - 9), base_y],
-            [max(0, w - 9 - skew), near_y],
-            [8, near_y],
-        ],
-        dtype=np.int32,
-    ).reshape((-1, 1, 2))
-    overlay = tile.copy()
-    cv2.fillPoly(overlay, [ground_poly], (58, 90, 62), cv2.LINE_AA)
-    cv2.addWeighted(overlay, 0.55, tile, 0.45, 0.0, tile)
-    cv2.polylines(tile, [ground_poly], isClosed=True, color=(110, 170, 116), thickness=1, lineType=cv2.LINE_AA)
-
     if not np.any(valid):
         cv2.putText(tile, title, (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
         cv2.putText(tile, "No pose", (12, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (140, 140, 140), 1, cv2.LINE_AA)
@@ -201,14 +255,61 @@ def _draw_view_tile(
     # Convert body y-up to image y-down to avoid upside-down rendering.
     xy[:, 1] = -(xy[:, 1] - cy) * s + h * 0.56
 
+    # Elliptical contact surface (instead of fixed parallelogram).
+    support_ids = [KPT["left_wrist"], KPT["right_wrist"], KPT["left_ankle"], KPT["right_ankle"]]
+    support = [sid for sid in support_ids if valid[sid]]
+    if len(support) >= 2:
+        pts = xy[np.array(support, dtype=np.int32)]
+        cx_e = float(np.mean(pts[:, 0]))
+        cy_e = float(np.max(pts[:, 1])) + 8.0
+        span_x = float(np.max(pts[:, 0]) - np.min(pts[:, 0]))
+        ax_x = int(max(28.0, min(w * 0.40, span_x * 0.65 + 36.0)))
+        ax_y = int(max(12.0, ax_x * 0.32))
+        overlay = tile.copy()
+        cv2.ellipse(overlay, (int(cx_e), int(cy_e)), (ax_x, ax_y), 0.0, 0, 360, (88, 150, 96), -1, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.50, tile, 0.50, 0.0, tile)
+        cv2.ellipse(tile, (int(cx_e), int(cy_e)), (ax_x, ax_y), 0.0, 0, 360, (150, 235, 168), 1, cv2.LINE_AA)
+
     for i, j in SKELETON_EDGES:
+        if i in HEAD_KPTS or j in HEAD_KPTS:
+            continue
         if valid[i] and valid[j]:
             p1 = (int(xy[i, 0]), int(xy[i, 1]))
             p2 = (int(xy[j, 0]), int(xy[j, 1]))
             cv2.line(tile, p1, p2, (0, 210, 255), 2, cv2.LINE_AA)
     for i in idx:
+        if i in HEAD_KPTS:
+            continue
         p = (int(xy[i, 0]), int(xy[i, 1]))
         cv2.circle(tile, p, 3, (80, 255, 120), -1, cv2.LINE_AA)
+
+    # Replace head keypoints with portrait sprite.
+    repo_root = Path(__file__).resolve().parents[1]
+    head_asset = _load_head_asset(str(repo_root / "data" / "head_wuyanzu.png"))
+    if head_asset is not None:
+        shoulder_ids = [KPT["left_shoulder"], KPT["right_shoulder"]]
+        shoulder_valid = [i for i in shoulder_ids if valid[i]]
+        if len(shoulder_valid) == 2:
+            sh_l = xy[KPT["left_shoulder"]]
+            sh_r = xy[KPT["right_shoulder"]]
+            shoulder_c = 0.5 * (sh_l + sh_r)
+            shoulder_w = float(np.linalg.norm(sh_r - sh_l))
+            roll = float(np.degrees(np.arctan2(sh_r[1] - sh_l[1], sh_r[0] - sh_l[0])))
+        else:
+            shoulder_c = np.array([float(w) * 0.5, float(h) * 0.45], dtype=np.float32)
+            shoulder_w = float(min(w, h) * 0.18)
+            roll = 0.0
+
+        head_ids = [KPT["nose"], KPT["left_eye"], KPT["right_eye"], KPT["left_ear"], KPT["right_ear"]]
+        head_valid = [i for i in head_ids if valid[i]]
+        if head_valid:
+            head_c = np.mean(xy[np.array(head_valid, dtype=np.int32)], axis=0)
+        else:
+            head_c = np.array([shoulder_c[0], shoulder_c[1] - shoulder_w * 0.65], dtype=np.float32)
+
+        size = int(max(36.0, shoulder_w * 1.05))
+        center = (float(head_c[0]), float(head_c[1] - size * 0.08))
+        _paste_rgba_center(tile, head_asset, center_xy=center, out_size=size, angle_deg=float(np.clip(roll * 0.8, -30.0, 30.0)))
 
     cv2.putText(tile, title, (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
 

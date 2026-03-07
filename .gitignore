@@ -28,6 +28,7 @@ MANIFEST
 
 # Data folder 
 output/
+outputs/
 data/
 
 # PyInstaller

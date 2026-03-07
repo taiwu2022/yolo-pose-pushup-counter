@@ -23,7 +23,7 @@ class BaseCounter:
         self.phase: str = "unknown"
         self.events: List[RepEvent] = []
 
-    def update(self, kpt_xy, kpt_conf, frame_idx: int) -> None:
+    def update(self, kpt_xy, kpt_conf, frame_idx: int, **kwargs) -> None:
         raise NotImplementedError
 
     def save_csv(self, csv_path: str | Path) -> None:

@@ -33,8 +33,18 @@ def parse_args():
     p.add_argument("--down-th", type=float, default=90.0, help="Elbow angle threshold for DOWN.")
     p.add_argument("--up-th", type=float, default=160.0, help="Elbow angle threshold for UP / count.")
     p.add_argument("--min-interval", type=float, default=0.35, help="Min interval between reps (seconds).")
+    p.add_argument("--min-rep-duration", type=float, default=1.0, help="Minimum duration of one push-up cycle (down->up), in seconds.")
     p.add_argument("--ema-alpha", type=float, default=0.25, help="EMA smoothing alpha for elbow angle.")
     p.add_argument("--hold-frames", type=int, default=2, help="Require consecutive frames to confirm a transition.")
+    p.add_argument("--min-hand-contacts", type=int, default=1, help="How many wrists must be near ground to enter ready state.")
+    p.add_argument("--contact-hold-frames", type=int, default=1, help="Consecutive near-ground frames required before ready latch.")
+    p.add_argument("--ready-hold-s", type=float, default=2.0, help="Keep ready state latched for N seconds after activation.")
+    p.add_argument("--hand-drop-fraction-start", type=float, default=0.90, help="Relative drop fraction of wrist-ground distance to start ready.")
+    p.add_argument("--ground-contact-tol", type=float, default=24.0, help="Absolute wrist-ground distance tolerance (pixels).")
+    p.add_argument("--ground-model-alpha", type=float, default=0.18, help="EMA alpha for temporal ground-line model.")
+    p.add_argument("--ground-model-min-points", type=int, default=14, help="Min sampled floor points to update ground-line model.")
+    p.add_argument("--head-drop-fraction-or", type=float, default=0.45, help="Reserved compatibility param for head-drop OR down trigger.")
+    p.add_argument("--head-recover-ratio-or", type=float, default=0.85, help="Reserved compatibility param for head-drop OR up trigger.")
     p.add_argument("--show", action="store_true", help="Show realtime window (can be slow).")
     p.add_argument("--no-skeleton", action="store_true", help="Do not draw skeleton.")
     p.add_argument("--no-hud", action="store_true", help="Do not draw HUD.")
@@ -62,20 +72,28 @@ def main():
         up_th=float(args.up_th),
         kpt_conf_th=float(args.kpt_conf),
         min_interval_s=float(args.min_interval),
+        min_rep_duration_s=float(args.min_rep_duration),
         ema_alpha=float(args.ema_alpha),
         hold_frames=int(args.hold_frames),
+        min_hand_contacts=int(args.min_hand_contacts),
+        contact_hold_frames=int(args.contact_hold_frames),
+        ready_hold_s=float(args.ready_hold_s),
+        hand_drop_fraction_start=float(args.hand_drop_fraction_start),
+        ground_contact_tol_px=float(args.ground_contact_tol),
+        ground_model_alpha=float(args.ground_model_alpha),
+        ground_model_min_points=int(args.ground_model_min_points),
+        head_drop_fraction_or=float(args.head_drop_fraction_or),
+        head_recover_ratio_or=float(args.head_recover_ratio_or),
     )
     counter = PushUpCounter(fps=meta.fps, cfg=cfg)
 
     model = YOLO(args.weights)
-    ground_seg = None
-    if not args.no_ground_mask:
-        ground_seg = GroundSegEstimator(
-            cfg=GroundSegConfig(
-                model_name=str(args.ground_seg_model),
-                stride=max(1, int(args.ground_seg_stride)),
-            )
+    ground_seg = GroundSegEstimator(
+        cfg=GroundSegConfig(
+            model_name=str(args.ground_seg_model),
+            stride=max(1, int(args.ground_seg_stride)),
         )
+    )
 
     panel_w = max(360, int(meta.width * 0.42)) if not args.no_sim_views else 0
     out_w = meta.width + panel_w
@@ -100,14 +118,15 @@ def main():
         if frame is None:
             break
 
+        seg_mask = ground_seg.update(frame) if ground_seg is not None else None
+
         det = extract_pose(result)
         if det is not None:
-            counter.update(det.xy, det.conf, frame_idx=frame_idx)
+            counter.update(det.xy, det.conf, frame_idx=frame_idx, ground_mask=seg_mask)
             if not args.no_skeleton:
                 draw_skeleton(frame, det.xy, det.conf, conf_th=float(args.kpt_conf))
 
         if not args.no_ground_mask:
-            seg_mask = ground_seg.update(frame) if ground_seg is not None else None
             draw_ground_mask_from_binary(frame, seg_mask, alpha=float(args.ground_alpha))
 
         if not args.no_hud:
@@ -116,6 +135,8 @@ def main():
                 count=counter.count,
                 phase=counter.phase,
                 angle=counter.last_angle,
+                head_ground_dist=counter.last_head_ground_ratio,
+                ready_to_count=counter.ready_to_count,
                 fps=meta.fps,
                 frame_idx=frame_idx,
             )
