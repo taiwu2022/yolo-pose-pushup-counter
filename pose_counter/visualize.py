@@ -227,6 +227,7 @@ def _draw_view_tile(
     yaw_deg: float,
     pitch_deg: float,
     title: str,
+    head_asset_path: str | None = None,
 ) -> None:
     h, w = tile.shape[:2]
     tile[:] = (22, 22, 22)
@@ -284,8 +285,10 @@ def _draw_view_tile(
         cv2.circle(tile, p, 3, (80, 255, 120), -1, cv2.LINE_AA)
 
     # Replace head keypoints with portrait sprite.
-    repo_root = Path(__file__).resolve().parents[1]
-    head_asset = _load_head_asset(str(repo_root / "data" / "head_wuyanzu.png"))
+    if head_asset_path is None:
+        repo_root = Path(__file__).resolve().parents[1]
+        head_asset_path = str(repo_root / "data" / "head_wuyanzu.png")
+    head_asset = _load_head_asset(head_asset_path)
     if head_asset is not None:
         shoulder_ids = [KPT["left_shoulder"], KPT["right_shoulder"]]
         shoulder_valid = [i for i in shoulder_ids if valid[i]]
@@ -311,6 +314,18 @@ def _draw_view_tile(
         center = (float(head_c[0]), float(head_c[1] - size * 0.08))
         _paste_rgba_center(tile, head_asset, center_xy=center, out_size=size, angle_deg=float(np.clip(roll * 0.8, -30.0, 30.0)))
 
+    # Figure bounding box in simulated view.
+    if len(idx) >= 2:
+        bb_min = np.min(xy[idx], axis=0).astype(np.int32)
+        bb_max = np.max(xy[idx], axis=0).astype(np.int32)
+        x0 = int(np.clip(bb_min[0] - 6, 0, w - 1))
+        y0 = int(np.clip(bb_min[1] - 6, 0, h - 1))
+        x1 = int(np.clip(bb_max[0] + 6, 0, w - 1))
+        y1 = int(np.clip(bb_max[1] + 6, 0, h - 1))
+        if x1 > x0 and y1 > y0:
+            cv2.rectangle(tile, (x0, y0), (x1, y1), (0, 210, 255), 1, cv2.LINE_AA)
+            cv2.putText(tile, "figure BB", (x0 + 2, max(14, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 210, 255), 1, cv2.LINE_AA)
+
     cv2.putText(tile, title, (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
 
 
@@ -320,6 +335,7 @@ def compose_with_simulated_views(
     kpt_conf: np.ndarray | None,
     conf_th: float = 0.25,
     panel_ratio: float = 0.42,
+    head_asset_path: str | None = None,
 ) -> np.ndarray:
     """Compose output frame with right-side pseudo-3D simulated viewpoint panels."""
     h, w = frame.shape[:2]
@@ -344,7 +360,15 @@ def compose_with_simulated_views(
         points_3d, valid = _normalize_pose_to_body_frame(kpt_xy, kpt_conf, conf_th=conf_th)
 
     tile = canvas[margin : margin + inner_h, inner_x0 : inner_x0 + inner_w]
-    _draw_view_tile(tile, points_3d, valid, yaw_deg=0.0, pitch_deg=8.0, title="Front view")
+    _draw_view_tile(
+        tile,
+        points_3d,
+        valid,
+        yaw_deg=0.0,
+        pitch_deg=8.0,
+        title="Front view",
+        head_asset_path=head_asset_path,
+    )
 
     return canvas
 

@@ -50,18 +50,11 @@ def parse_args():
     p.add_argument("--neg-ratio", type=float, default=1.0, help="Max negatives per positive.")
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument(
-        "--split-mode",
-        type=str,
-        choices=["random", "video"],
-        default="video",
-        help="Split mode: random clip split or strict video-level split.",
-    )
-    p.add_argument(
         "--val-videos",
         type=str,
         nargs="*",
         default=None,
-        help="Optional video basenames for val split, e.g. test.MOV 6.MOV. Only used in video split mode.",
+        help="Optional video basenames for val split, e.g. test.MOV 6.MOV.",
     )
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -240,53 +233,37 @@ def main():
     if not pos_all:
         raise SystemExit("No pseudo-positive clips found. Lower --pos-angle-range or use more push-up videos.")
 
-    train_data: list[tuple[dict, int]]
-    val_data: list[tuple[dict, int]]
-    train_video_names: list[str]
-    val_video_names: list[str]
-
-    if args.split_mode == "video":
-        video_names = sorted(per_video_samples.keys())
-        if args.val_videos:
-            val_name_set = set(args.val_videos)
-            unknown = sorted([n for n in val_name_set if n not in per_video_samples])
-            if unknown:
-                raise SystemExit(f"--val-videos contains unknown names: {unknown}")
-            val_video_names = [n for n in video_names if n in val_name_set]
-        else:
-            rng = random.Random(args.seed)
-            shuffled = list(video_names)
-            rng.shuffle(shuffled)
-            n_val_videos = max(1, int(round(len(shuffled) * float(args.val_ratio))))
-            n_val_videos = min(n_val_videos, max(1, len(shuffled) - 1))
-            val_video_names = sorted(shuffled[:n_val_videos])
-
-        train_video_names = [n for n in video_names if n not in set(val_video_names)]
-        if not train_video_names or not val_video_names:
-            raise SystemExit("Video split produced empty train or val set. Adjust --val-ratio/--val-videos.")
-
-        train_pos = [s for n in train_video_names for s in per_video_samples[n]["pos"]]
-        train_neg = [s for n in train_video_names for s in per_video_samples[n]["neg"]]
-        val_pos = [s for n in val_video_names for s in per_video_samples[n]["pos"]]
-        val_neg = [s for n in val_video_names for s in per_video_samples[n]["neg"]]
-
-        train_neg = cap_negatives(train_neg, len(train_pos), float(args.neg_ratio))
-        val_neg = cap_negatives(val_neg, len(val_pos), float(args.neg_ratio))
-
-        train_data = [(s, 1) for s in train_pos] + [(s, 0) for s in train_neg]
-        val_data = [(s, 1) for s in val_pos] + [(s, 0) for s in val_neg]
-        random.shuffle(train_data)
-        random.shuffle(val_data)
+    video_names = sorted(per_video_samples.keys())
+    if args.val_videos:
+        val_name_set = set(args.val_videos)
+        unknown = sorted([n for n in val_name_set if n not in per_video_samples])
+        if unknown:
+            raise SystemExit(f"--val-videos contains unknown names: {unknown}")
+        val_video_names = [n for n in video_names if n in val_name_set]
     else:
-        neg_all = [s for one in per_video_samples.values() for s in one["neg"]]
-        neg_all = cap_negatives(neg_all, len(pos_all), float(args.neg_ratio))
-        data = [(s, 1) for s in pos_all] + [(s, 0) for s in neg_all]  # 1=push_up, 0=other
-        random.shuffle(data)
-        n_val = max(1, int(len(data) * float(args.val_ratio))) if len(data) > 5 else 1
-        val_data = data[:n_val]
-        train_data = data[n_val:]
-        train_video_names = sorted({Path(s["video"]).name for s, _ in train_data})
-        val_video_names = sorted({Path(s["video"]).name for s, _ in val_data})
+        rng = random.Random(args.seed)
+        shuffled = list(video_names)
+        rng.shuffle(shuffled)
+        n_val_videos = max(1, int(round(len(shuffled) * float(args.val_ratio))))
+        n_val_videos = min(n_val_videos, max(1, len(shuffled) - 1))
+        val_video_names = sorted(shuffled[:n_val_videos])
+
+    train_video_names = [n for n in video_names if n not in set(val_video_names)]
+    if not train_video_names or not val_video_names:
+        raise SystemExit("Video split produced empty train or val set. Adjust --val-ratio/--val-videos.")
+
+    train_pos = [s for n in train_video_names for s in per_video_samples[n]["pos"]]
+    train_neg = [s for n in train_video_names for s in per_video_samples[n]["neg"]]
+    val_pos = [s for n in val_video_names for s in per_video_samples[n]["pos"]]
+    val_neg = [s for n in val_video_names for s in per_video_samples[n]["neg"]]
+
+    train_neg = cap_negatives(train_neg, len(train_pos), float(args.neg_ratio))
+    val_neg = cap_negatives(val_neg, len(val_pos), float(args.neg_ratio))
+
+    train_data: list[tuple[dict, int]] = [(s, 1) for s in train_pos] + [(s, 0) for s in train_neg]
+    val_data: list[tuple[dict, int]] = [(s, 1) for s in val_pos] + [(s, 0) for s in val_neg]
+    random.shuffle(train_data)
+    random.shuffle(val_data)
 
     if not train_data or not val_data:
         raise SystemExit("Empty train or val clips after split. Adjust thresholds/ratio.")
@@ -309,7 +286,7 @@ def main():
 
     summary = {
         "videos": [str(v) for v in videos],
-        "split_mode": args.split_mode,
+        "split_mode": "video",
         "train_videos": train_video_names,
         "val_videos": val_video_names,
         "num_train": len(train_anns),

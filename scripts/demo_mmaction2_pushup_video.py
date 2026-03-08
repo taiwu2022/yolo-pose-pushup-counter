@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from pose_counter.pose_utils import extract_pose
-from pose_counter.visualize import draw_skeleton
+from pose_counter.visualize import compose_with_simulated_views, draw_skeleton
 from pose_counter.constants import KPT
 
 
@@ -37,14 +37,21 @@ def parse_args():
     p.add_argument("--iou", type=float, default=0.45)
     p.add_argument("--stride", type=int, default=12, help="Sliding window stride for action inference.")
     p.add_argument("--device", type=str, default="cpu", help="MMAction2 device, e.g. cpu or mps.")
+    p.add_argument("--simulated-view", action="store_true", help="Compose 1:1 split view with right-side simulated front view.")
+    p.add_argument(
+        "--head-image",
+        type=str,
+        default="/Users/taiwu/Documents/GitHub/yolo-pose-pushup-counter/data/head_wuyanzu.png",
+        help="Head portrait image path for simulated view.",
+    )
     p.add_argument("--kpt-conf", type=float, default=0.25, help="Keypoint conf threshold for drawing.")
     p.add_argument("--push-th", type=float, default=0.72, help="Upper threshold to enter push_up state.")
     p.add_argument("--not-push-th", type=float, default=0.45, help="Lower threshold to return to not_pushup.")
     p.add_argument("--smooth-alpha", type=float, default=0.15, help="EMA alpha for smoothed probability.")
-    p.add_argument("--min-push-s", type=float, default=0.8, help="Minimum push_up-state duration to count 1 event.")
-    p.add_argument("--elbow-down-th", type=float, default=120.0, help="Elbow angle threshold to enter down.")
-    p.add_argument("--elbow-up-th", type=float, default=157.0, help="Elbow angle threshold to finish rep on up.")
-    p.add_argument("--min-rep-s", type=float, default=1.0, help="Minimum down->up duration for one valid rep.")
+    p.add_argument("--head-near-ratio", type=float, default=0.80, help="Near-ground gate: dist <= baseline * ratio enters down.")
+    p.add_argument("--head-far-ratio", type=float, default=0.86, help="Recovery gate: dist >= baseline * ratio finishes rep.")
+    p.add_argument("--head-baseline-alpha", type=float, default=0.08, help="EMA alpha for head-ground baseline in up phase.")
+    p.add_argument("--min-rep-s", type=float, default=0.70, help="Minimum down->up duration for one valid rep.")
     return p.parse_args()
 
 
@@ -55,7 +62,7 @@ def draw_hud(
     smooth_prob: float,
     state: str,
     count: int,
-    elbow_angle: float,
+    head_ground_dist: float,
 ):
     if np.isnan(window_prob):
         txt_w = "window prob: N/A"
@@ -65,39 +72,44 @@ def draw_hud(
         color = (0, 220, 0) if state == "push_up" else (0, 180, 255)
 
     txt_s = "smooth prob: N/A" if np.isnan(smooth_prob) else f"smooth prob: {smooth_prob:.3f}"
-    txt_e = "elbow angle: N/A" if np.isnan(elbow_angle) else f"elbow angle: {elbow_angle:.1f}"
+    txt_h = "head-ground dist: N/A" if np.isnan(head_ground_dist) else f"head-ground dist: {head_ground_dist:.1f}px"
     cv2.rectangle(frame, (18, 18), (520, 218), (20, 20, 20), thickness=-1)
     cv2.putText(frame, f"frame: {frame_idx}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (230, 230, 230), 2, cv2.LINE_AA)
     cv2.putText(frame, txt_w, (30, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
     cv2.putText(frame, txt_s, (30, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
     cv2.putText(frame, f"state: {state}", (30, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
-    cv2.putText(frame, txt_e, (30, 178), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (120, 235, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, txt_h, (30, 178), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (120, 235, 255), 2, cv2.LINE_AA)
     cv2.putText(frame, f"push_up count: {count}", (30, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
     return frame
 
 
-def _angle_deg(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-    ba = a - b
-    bc = c - b
-    nba = float(np.linalg.norm(ba) + 1e-9)
-    nbc = float(np.linalg.norm(bc) + 1e-9)
-    cosang = float(np.clip(np.dot(ba, bc) / (nba * nbc), -1.0, 1.0))
-    return float(np.degrees(np.arccos(cosang)))
-
-
-def _elbow_angle(xy: np.ndarray | None, conf: np.ndarray | None, conf_th: float) -> float:
+def _head_ground_dist(
+    xy: np.ndarray | None,
+    conf: np.ndarray | None,
+    bbox_xyxy: np.ndarray | None,
+    conf_th: float,
+) -> float:
     if xy is None or conf is None:
         return float("nan")
-    vals = []
-    for s, e, w in [
-        (KPT["left_shoulder"], KPT["left_elbow"], KPT["left_wrist"]),
-        (KPT["right_shoulder"], KPT["right_elbow"], KPT["right_wrist"]),
-    ]:
-        if conf[s] >= conf_th and conf[e] >= conf_th and conf[w] >= conf_th:
-            vals.append(_angle_deg(xy[s], xy[e], xy[w]))
-    if not vals:
+    if bbox_xyxy is None:
         return float("nan")
-    return float(np.mean(vals))
+    head_y = None
+    if conf[KPT["nose"]] >= conf_th:
+        head_y = float(xy[KPT["nose"], 1])
+    else:
+        cand = []
+        for idx in [KPT["left_eye"], KPT["right_eye"], KPT["left_ear"], KPT["right_ear"]]:
+            if conf[idx] >= conf_th:
+                cand.append(float(xy[idx, 1]))
+        if cand:
+            head_y = float(np.mean(cand))
+        else:
+            if conf[KPT["left_shoulder"]] >= conf_th and conf[KPT["right_shoulder"]] >= conf_th:
+                head_y = float(0.5 * (xy[KPT["left_shoulder"], 1] + xy[KPT["right_shoulder"], 1]))
+    if head_y is None:
+        return float("nan")
+    ground_y = float(bbox_xyxy[3])
+    return float(max(0.0, ground_y - head_y))
 
 
 def main():
@@ -211,15 +223,17 @@ def main():
             last = alpha * p + (1.0 - alpha) * last
         smooth[i] = last
 
-    # Hysteresis state from classifier probabilities.
+    # Hysteresis state from classifier probabilities (for display).
     state = "not_pushup"
-    state_start = 0
-    prob_count = 0
-    # Rep counter from elbow angle trajectory (more suitable for reps).
-    elbow_series = np.array([_elbow_angle(draw_xy[i], draw_conf[i], float(args.kpt_conf)) for i in range(n)], dtype=np.float32)
+    # Rep counter from head-to-ground (bottom bbox) distance.
+    head_dist = np.array(
+        [_head_ground_dist(draw_xy[i], draw_conf[i], draw_bbox[i], float(args.kpt_conf)) for i in range(n)],
+        dtype=np.float32,
+    )
     rep_count = 0
     rep_phase = "up"
     rep_start_idx = -1
+    baseline = float("nan")
     fps_eff = 30.0
 
     cap = cv2.VideoCapture(str(video_path))
@@ -227,12 +241,8 @@ def main():
     if not fps or fps <= 0:
         fps = 30.0
     fps_eff = float(fps)
-    writer = cv2.VideoWriter(
-        str(out_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        float(fps),
-        (int(W), int(H)),
-    )
+    out_w = int(W * 2) if args.simulated_view else int(W)
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (out_w, int(H)))
 
     i = 0
     while True:
@@ -245,26 +255,28 @@ def main():
         if not np.isnan(ps):
             if state == "not_pushup" and ps >= float(args.push_th):
                 state = "push_up"
-                state_start = i
             elif state == "push_up" and ps <= float(args.not_push_th):
-                dur_s = (i - state_start) / max(1e-6, fps_eff)
-                if dur_s >= float(args.min_push_s):
-                    prob_count += 1
                 state = "not_pushup"
-                state_start = i
 
-        # Elbow-based repetition counting.
-        ea = float(elbow_series[i]) if i < len(elbow_series) else float("nan")
-        if not np.isnan(ea):
-            if rep_phase == "up" and ea <= float(args.elbow_down_th):
-                rep_phase = "down"
-                rep_start_idx = i
-            elif rep_phase == "down" and ea >= float(args.elbow_up_th):
-                dur_s = (i - rep_start_idx) / max(1e-6, fps_eff) if rep_start_idx >= 0 else 0.0
-                if dur_s >= float(args.min_rep_s):
-                    rep_count += 1
-                rep_phase = "up"
-                rep_start_idx = -1
+        # Head-distance-based repetition counting.
+        hd = float(head_dist[i]) if i < len(head_dist) else float("nan")
+        if not np.isnan(hd) and hd > 1e-3:
+            if rep_phase == "up":
+                if np.isnan(baseline):
+                    baseline = hd
+                else:
+                    a = float(np.clip(args.head_baseline_alpha, 0.001, 1.0))
+                    baseline = (1.0 - a) * baseline + a * hd
+                if hd <= baseline * float(args.head_near_ratio):
+                    rep_phase = "down"
+                    rep_start_idx = i
+            elif rep_phase == "down":
+                if not np.isnan(baseline) and hd >= baseline * float(args.head_far_ratio):
+                    dur_s = (i - rep_start_idx) / max(1e-6, fps_eff) if rep_start_idx >= 0 else 0.0
+                    if dur_s >= float(args.min_rep_s):
+                        rep_count += 1
+                    rep_phase = "up"
+                    rep_start_idx = -1
 
         # Draw bbox + skeleton.
         if i < len(draw_bbox) and draw_bbox[i] is not None:
@@ -273,8 +285,21 @@ def main():
         if i < len(draw_xy) and draw_xy[i] is not None and draw_conf[i] is not None:
             draw_skeleton(frame, draw_xy[i], draw_conf[i], conf_th=float(args.kpt_conf))
 
-        frame = draw_hud(frame, i, p, ps, state, rep_count, ea)
-        writer.write(frame)
+        frame = draw_hud(frame, i, p, ps, state, rep_count, hd)
+
+        if args.simulated_view:
+            out_frame = compose_with_simulated_views(
+                frame=frame,
+                kpt_xy=draw_xy[i] if i < len(draw_xy) else None,
+                kpt_conf=draw_conf[i] if i < len(draw_conf) else None,
+                conf_th=float(args.kpt_conf),
+                panel_ratio=1.0,
+                head_asset_path=args.head_image,
+            )
+        else:
+            out_frame = frame
+
+        writer.write(out_frame)
         i += 1
 
     cap.release()
@@ -284,44 +309,44 @@ def main():
         csv_path = Path(args.csv)
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(csv_path, "w", encoding="utf-8") as f:
-            f.write("frame,window_prob,smoothed_prob,state,prob_count,elbow_angle,rep_count\n")
+            f.write("frame,window_prob,smoothed_prob,state,head_ground_dist,rep_count\n")
             running_state = "not_pushup"
-            running_start = 0
-            running_prob_count = 0
             running_rep_count = 0
             running_rep_phase = "up"
             running_rep_start = -1
+            running_baseline = float("nan")
             for j, p in enumerate(probs.tolist()):
                 ps = float(smooth[j]) if j < len(smooth) else float("nan")
                 if not np.isnan(ps):
                     if running_state == "not_pushup" and ps >= float(args.push_th):
                         running_state = "push_up"
-                        running_start = j
                     elif running_state == "push_up" and ps <= float(args.not_push_th):
-                        dur_s = (j - running_start) / max(1e-6, fps_eff)
-                        if dur_s >= float(args.min_push_s):
-                            running_prob_count += 1
                         running_state = "not_pushup"
-                        running_start = j
-                ea = float(elbow_series[j]) if j < len(elbow_series) else float("nan")
-                if not np.isnan(ea):
-                    if running_rep_phase == "up" and ea <= float(args.elbow_down_th):
-                        running_rep_phase = "down"
-                        running_rep_start = j
-                    elif running_rep_phase == "down" and ea >= float(args.elbow_up_th):
-                        dur_s = (j - running_rep_start) / max(1e-6, fps_eff) if running_rep_start >= 0 else 0.0
-                        if dur_s >= float(args.min_rep_s):
-                            running_rep_count += 1
-                        running_rep_phase = "up"
-                        running_rep_start = -1
+                hd = float(head_dist[j]) if j < len(head_dist) else float("nan")
+                if not np.isnan(hd) and hd > 1e-3:
+                    if running_rep_phase == "up":
+                        if np.isnan(running_baseline):
+                            running_baseline = hd
+                        else:
+                            a = float(np.clip(args.head_baseline_alpha, 0.001, 1.0))
+                            running_baseline = (1.0 - a) * running_baseline + a * hd
+                        if hd <= running_baseline * float(args.head_near_ratio):
+                            running_rep_phase = "down"
+                            running_rep_start = j
+                    elif running_rep_phase == "down":
+                        if not np.isnan(running_baseline) and hd >= running_baseline * float(args.head_far_ratio):
+                            dur_s = (j - running_rep_start) / max(1e-6, fps_eff) if running_rep_start >= 0 else 0.0
+                            if dur_s >= float(args.min_rep_s):
+                                running_rep_count += 1
+                            running_rep_phase = "up"
+                            running_rep_start = -1
                 p_txt = "" if np.isnan(p) else f"{p:.6f}"
                 ps_txt = "" if np.isnan(ps) else f"{ps:.6f}"
-                ea_txt = "" if np.isnan(ea) else f"{ea:.3f}"
-                f.write(f"{j},{p_txt},{ps_txt},{running_state},{running_prob_count},{ea_txt},{running_rep_count}\n")
+                hd_txt = "" if np.isnan(hd) else f"{hd:.3f}"
+                f.write(f"{j},{p_txt},{ps_txt},{running_state},{hd_txt},{running_rep_count}\n")
 
     print(f"[DONE] output video: {out_path}")
-    print(f"[DONE] final push_up count (elbow): {rep_count}")
-    print(f"[DONE] classifier-state event count: {prob_count}")
+    print(f"[DONE] final push_up count (head-ground): {rep_count}")
     if args.csv:
         print(f"[DONE] csv: {args.csv}")
 
